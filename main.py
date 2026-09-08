@@ -6,11 +6,15 @@ POST 转发器
 - 精美 UI 配置界面，监听端口默认 1403 可修改，白名单按行分割（留空=全部禁止）
 - 系统托盘后台运行，双击托盘图标打开配置界面
 - 配置持久化（Windows 注册表，不产生文件）
+- 单实例运行：多开时提醒用户选择重启或关闭新实例
 """
 
 import json
+import os
 import sys
 import time
+import ctypes
+import subprocess
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
@@ -22,8 +26,12 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextBrowser, QFrame,
     QSpinBox, QGraphicsDropShadowEffect, QTextEdit, QSystemTrayIcon,
-    QMenu, QSizePolicy,
+    QMenu, QSizePolicy, QMessageBox,
 )
+
+# Windows 互斥锁名称（全局命名空间，防止跨会话多开）
+MUTEX_NAME = "Global\\NSDPRO_PostForwarder_SingleInstance"
+ERROR_ALREADY_EXISTS = 183
 
 
 APP_ORG = "NSDPRO"
@@ -739,19 +747,75 @@ class MainWindow(QMainWindow):
             event.accept()
 
 
+def _acquire_mutex():
+    """尝试获取全局互斥锁。返回 (mutex_handle, is_first_instance)。"""
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    is_first = (ctypes.windll.kernel32.GetLastError() != ERROR_ALREADY_EXISTS)
+    return mutex, is_first
+
+
+def _kill_other_instances():
+    """杀掉除当前进程外的所有同名进程（用于"重启"场景）。"""
+    current_pid = os.getpid()
+    if getattr(sys, "frozen", False):
+        # 打包后的 exe：按进程名杀，排除自身 PID
+        proc_name = os.path.basename(sys.executable)
+        subprocess.run(
+            ["taskkill", "/F", "/IM", proc_name, "/FI", f"PID ne {current_pid}"],
+            capture_output=True,
+        )
+    else:
+        # 脚本模式：通过命令行匹配 main.py 来精确杀进程
+        result = subprocess.run(
+            ["wmic", "process", "where",
+             f"CommandLine like '%main.py%' and ProcessId!={current_pid}",
+             "call", "terminate"],
+            capture_output=True,
+        )
+    # 等待旧进程释放互斥锁
+    time.sleep(1.0)
+
+
 def main():
+    # ---- 单实例检测 ----
+    mutex, is_first = _acquire_mutex()
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_ORG)
-    # 高 DPI
     try:
         app.setStyle("Fusion")
     except Exception:
         pass
-    # 关闭最后一个窗口不自动退出（托盘后台运行）
+
+    if not is_first:
+        # 已有实例在运行，弹出选择对话框
+        msg = QMessageBox()
+        msg.setWindowTitle("POST 转发器 - 已在运行")
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setText("程序已在运行中，请选择操作：")
+        restart_btn = msg.addButton("重启软件", QMessageBox.ButtonRole.AcceptRole)
+        close_btn = msg.addButton("关闭新开的程序", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(close_btn)
+        msg.exec()
+
+        if msg.clickedButton() is restart_btn:
+            # 杀掉旧实例，释放并重新获取互斥锁
+            _kill_other_instances()
+            ctypes.windll.kernel32.CloseHandle(mutex)
+            mutex, is_first = _acquire_mutex()
+            if not is_first:
+                QMessageBox.critical(None, "POST 转发器", "无法重启：旧实例仍在运行。")
+                sys.exit(1)
+            # 落入下方正常启动流程
+        else:
+            # 关闭新实例，保留原运行实例
+            ctypes.windll.kernel32.CloseHandle(mutex)
+            sys.exit(0)
+
+    # ---- 正常启动 ----
     app.setQuitOnLastWindowClosed(False)
     win = MainWindow()
-    # 应用图标到任务栏/Alt-Tab
     app.setWindowIcon(win._app_icon())
     win.show()
     sys.exit(app.exec())
